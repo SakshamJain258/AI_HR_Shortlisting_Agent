@@ -1,0 +1,13 @@
+google-generativeai
+langchain
+langgraph
+langchain-google-genai
+sentence-transformers
+PyMuPDF
+python-docx
+pydantic>=2
+requests
+reportlab
+streamlit
+python-dotenv
+numpy
