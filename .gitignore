@@ -17,4 +17,6 @@ data/overrides/*
 venv/
 env/
 ENV/
-.docs/
+docs/
+New Version/
+PROJECT_STRUCTURAL_REPORT.md

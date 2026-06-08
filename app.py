@@ -23,6 +23,8 @@ from hr_shortlister.services.override_logger import append_override_log, apply_o
 from hr_shortlister.services.report_generator import DIMENSION_LABELS, generate_pdf_report
 
 
+from hr_shortlister.core.llm_client import LLMQuotaError
+
 load_dotenv()
 
 st.set_page_config(
@@ -460,22 +462,39 @@ def _run_analysis(jd_text: str, jd_file, resumes: list, linkedin_urls_text: str)
         return
 
     completed = 1
+    gemini_ok = True
     for resume in resumes:
         label = getattr(resume, "name", "resume")
-        status.info(f"Processing resume: {label} | ETA {_eta(start_time, completed, total_steps)}")
+        status.info(
+            f"{'[Gemini] ' if gemini_ok else '[Local fallback] '}Processing resume: {label}"
+            f" ({completed}/{total_steps - 1}) | ETA {_eta(start_time, completed, total_steps)}"
+        )
         try:
             candidate = parse_resume_file(resume.name, resume.getvalue())
-            _score_and_store(parsed_jd, candidate)
+            used_local = _score_and_store(parsed_jd, candidate)
+            if used_local:
+                gemini_ok = False
+        except LLMQuotaError:
+            gemini_ok = False
+            st.session_state.candidate_errors.append(f"{label}: Gemini quota exhausted, local fallback also failed.")
         except Exception as exc:
             st.session_state.candidate_errors.append(f"{label}: {exc}")
         completed += 1
         progress.progress(completed / total_steps)
 
     for url in linkedin_urls:
-        status.info(f"Processing LinkedIn profile: {url} | ETA {_eta(start_time, completed, total_steps)}")
+        status.info(
+            f"{'[Gemini] ' if gemini_ok else '[Local fallback] '}Processing LinkedIn: {url}"
+            f" ({completed}/{total_steps - 1}) | ETA {_eta(start_time, completed, total_steps)}"
+        )
         try:
             candidate = fetch_linkedin_profile(url)
-            _score_and_store(parsed_jd, candidate)
+            used_local = _score_and_store(parsed_jd, candidate)
+            if used_local:
+                gemini_ok = False
+        except LLMQuotaError:
+            gemini_ok = False
+            st.session_state.candidate_errors.append(f"{url}: Gemini quota exhausted, local fallback also failed.")
         except Exception as exc:
             st.session_state.candidate_errors.append(f"{url}: {exc}")
         completed += 1
@@ -483,6 +502,7 @@ def _run_analysis(jd_text: str, jd_file, resumes: list, linkedin_urls_text: str)
 
     st.session_state.results = _sorted_results(st.session_state.results)
     if st.session_state.results:
+        status.info("Generating PDF report...")
         st.session_state.report_path = generate_pdf_report(
             parsed_jd.job_title,
             st.session_state.results,
@@ -490,14 +510,31 @@ def _run_analysis(jd_text: str, jd_file, resumes: list, linkedin_urls_text: str)
             st.session_state.current_overrides,
         )
 
-    status.success("Analysis complete.")
+    if not gemini_ok:
+        st.warning(
+            "⚠️ Gemini API quota was exhausted. Candidates were scored using the local "
+            "rule-based fallback — scores are approximate. Add billing to your Gemini "
+            "API key at ai.google.dev for LLM-powered scoring."
+        )
+    status.success(f"Analysis complete — {len(st.session_state.results)} candidate(s) evaluated.")
 
 
-def _score_and_store(parsed_jd: ParsedJD, candidate: CandidateProfile) -> None:
+def _score_and_store(parsed_jd: ParsedJD, candidate: CandidateProfile) -> bool:
+    """Score and store a candidate. Returns True if local fallback was used."""
+    from hr_shortlister.agents.scoring_agent import score_candidate_locally
     semantic_match = calculate_semantic_match(parsed_jd, candidate)
-    result = score_candidate(parsed_jd, candidate, semantic_match)
+    used_local = False
+    try:
+        result = score_candidate(parsed_jd, candidate, semantic_match)
+        # Detect local fallback by checking the summary text
+        if "local fallback" in (result.summary or "").lower():
+            used_local = True
+    except (LLMQuotaError, Exception):
+        result = score_candidate_locally(parsed_jd, candidate, semantic_match)
+        used_local = True
     st.session_state.candidates.append(candidate)
     st.session_state.results.append(result)
+    return used_local
 
 
 def _render_results() -> None:

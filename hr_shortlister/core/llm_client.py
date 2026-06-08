@@ -11,8 +11,6 @@ from pydantic import BaseModel, ValidationError
 
 T = TypeVar("T", bound=BaseModel)
 MODEL_FALLBACKS = [
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
     "gemini-2.0-flash",
     "gemini-2.0-flash-lite",
     "gemini-1.5-flash-002",
@@ -37,7 +35,7 @@ def generate_structured_json(
     system_prompt: str,
     user_prompt: str,
     *,
-    max_retries: int = 3,
+    max_retries: int = 2,
     temperature: float = 0.1,
 ) -> T:
     """Ask Gemini for JSON and validate it against a Pydantic model."""
@@ -65,12 +63,16 @@ Return JSON matching this schema:
             raise
         except (json.JSONDecodeError, ValidationError, LLMResponseError) as exc:
             last_error = exc
-            validation_hint = (
-                "The previous response failed JSON/schema validation. "
-                f"Retry with valid JSON only. Validation error: {exc}"
-            )
+            if attempt < max_retries:
+                validation_hint = (
+                    "The previous response failed JSON/schema validation. "
+                    f"Retry with valid JSON only. Validation error: {exc}"
+                )
+            else:
+                # On last attempt, raise with more context
+                pass
 
-    raise LLMResponseError(f"Gemini did not return valid {schema.__name__}: {last_error}")
+    raise LLMResponseError(f"Gemini did not return valid {schema.__name__} after {max_retries} retries: {last_error}")
 
 
 def _generate_with_gemini(prompt: str, *, temperature: float) -> str:
@@ -101,19 +103,29 @@ def _generate_with_gemini(prompt: str, *, temperature: float) -> str:
                     "temperature": temperature,
                     "response_mime_type": "application/json",
                 },
+                request_options={"timeout": 30},
             )
             break
         except TypeError:
             try:
-                response = model.generate_content(prompt)
+                response = model.generate_content(
+                    prompt,
+                    request_options={"timeout": 30},
+                )
                 break
             except Exception as exc:
                 last_error = exc
+                if _is_quota_error(exc):
+                    # Quota is shared across all models – no point trying others.
+                    raise LLMQuotaError(f"Gemini quota exceeded: {exc}") from exc
                 if _should_try_next_model(exc):
                     continue
                 raise
         except Exception as exc:
             last_error = exc
+            if _is_quota_error(exc):
+                # Quota is shared across all models – no point trying others.
+                raise LLMQuotaError(f"Gemini quota exceeded: {exc}") from exc
             if _should_try_next_model(exc):
                 continue
             raise
@@ -166,7 +178,18 @@ def _is_quota_error(exc: Exception) -> bool:
 
 
 def _should_try_next_model(exc: Exception) -> bool:
-    return _is_missing_model_error(exc) or _is_quota_error(exc)
+    # Quota errors are NOT retried across models – quota is shared by API key.
+    return _is_missing_model_error(exc) or _is_timeout_error(exc)
+
+
+def _is_timeout_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return (
+        "timeout" in text
+        or "deadline exceeded" in text
+        or "request timeout" in text
+        or "connection timeout" in text
+    )
 
 
 def _extract_json(raw: str) -> object:
